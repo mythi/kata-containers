@@ -30,12 +30,14 @@ use crate::device::block_device_handler::{
 };
 use crate::device::nvdimm_device_handler::wait_for_pmem_device;
 use crate::device::scsi_device_handler::get_scsi_device_name;
+use crate::sandbox::Sandbox;
 use crate::storage::{
     common_storage_handler, new_device, set_ownership, StorageContext, StorageHandler,
 };
 use slog::Logger;
 #[cfg(target_arch = "s390x")]
 use std::str::FromStr;
+use tokio::sync::Mutex;
 
 const EPHEMERAL_ENCRYPTION_DRIVER_OPTION: &str = "encryption_key=ephemeral";
 const MKFS_EXT4: &str = "mkfs.ext4";
@@ -58,6 +60,63 @@ fn get_device_number(dev_path: &str, metadata: Option<&fs::Metadata>) -> Result<
         }
     };
     Ok(format!("{}:{}", major(dev_id), minor(dev_id)))
+}
+
+pub(crate) async fn get_block_device_number_for_storage(
+    storage: &mut Storage,
+    sandbox: &Arc<Mutex<Sandbox>>,
+) -> Result<String> {
+    match storage.driver.as_str() {
+        DRIVER_BLK_MMIO_TYPE => {
+            if !Path::new(&storage.source).exists() {
+                get_virtio_blk_mmio_device_name(sandbox, &storage.source)
+                    .await
+                    .context("failed to get mmio device name")?;
+            }
+            get_device_number(&storage.source, None)
+        }
+        DRIVER_BLK_PCI_TYPE => {
+            if storage.source.starts_with("/dev") {
+                let metadata = fs::metadata(&storage.source)
+                    .context(format!("get metadata on file {:?}", &storage.source))?;
+                let mode = metadata.permissions().mode();
+                if mode & libc::S_IFBLK == 0 {
+                    return Err(anyhow!("Invalid device {}", &storage.source));
+                }
+                get_device_number(&storage.source, Some(&metadata))
+            } else {
+                let (root_complex, pcipath) = pcipath_from_dev_tree_path(&storage.source)?;
+                let dev_path = get_virtio_blk_pci_device_name(sandbox, root_complex, &pcipath)
+                    .await
+                    .context("failed to get pci device name")?;
+                storage.source = dev_path;
+                get_device_number(&storage.source, None)
+            }
+        }
+        DRIVER_SCSI_TYPE => {
+            let dev_path = get_scsi_device_name(sandbox, &storage.source).await?;
+            storage.source = dev_path.clone();
+            get_device_number(&dev_path, None)
+        }
+        #[cfg(target_arch = "s390x")]
+        DRIVER_BLK_CCW_TYPE => {
+            let ccw_device = ccw::Device::from_str(&storage.source)?;
+            let dev_path = get_virtio_blk_ccw_device_name(sandbox, &ccw_device).await?;
+            storage.source = dev_path;
+            get_device_number(&storage.source, None)
+        }
+        _ => Err(anyhow!(
+            "unsupported trusted storage block driver {}",
+            storage.driver
+        )),
+    }
+}
+
+pub(crate) fn is_ephemeral_encrypted_block_storage(storage: &Storage) -> bool {
+    storage
+        .driver_options
+        .iter()
+        .any(|opt| opt == EPHEMERAL_ENCRYPTION_DRIVER_OPTION)
 }
 
 async fn handle_block_storage(
@@ -244,15 +303,10 @@ impl StorageHandler for VirtioBlkMmioHandler {
     #[instrument]
     async fn create_device(
         &self,
-        storage: Storage,
+        mut storage: Storage,
         ctx: &mut StorageContext,
     ) -> Result<Arc<dyn StorageDevice>> {
-        if !Path::new(&storage.source).exists() {
-            get_virtio_blk_mmio_device_name(ctx.sandbox, &storage.source)
-                .await
-                .context("failed to get mmio device name")?;
-        }
-        let dev_num = get_device_number(&storage.source, None)?;
+        let dev_num = get_block_device_number_for_storage(&mut storage, ctx.sandbox).await?;
         handle_block_storage(ctx.logger, &storage, &dev_num).await
     }
 }
@@ -273,26 +327,7 @@ impl StorageHandler for VirtioBlkPciHandler {
         mut storage: Storage,
         ctx: &mut StorageContext,
     ) -> Result<Arc<dyn StorageDevice>> {
-        let dev_num: String;
-
-        // If hot-plugged, get the device node path based on the PCI path
-        // otherwise use the virt path provided in Storage Source
-        if storage.source.starts_with("/dev") {
-            let metadata = fs::metadata(&storage.source)
-                .context(format!("get metadata on file {:?}", &storage.source))?;
-            let mode = metadata.permissions().mode();
-            if mode & libc::S_IFBLK == 0 {
-                return Err(anyhow!("Invalid device {}", &storage.source));
-            }
-            dev_num = get_device_number(&storage.source, Some(&metadata))?;
-        } else {
-            let (root_complex, pcipath) = pcipath_from_dev_tree_path(&storage.source)?;
-            let dev_path =
-                get_virtio_blk_pci_device_name(ctx.sandbox, root_complex, &pcipath).await?;
-            storage.source = dev_path;
-            dev_num = get_device_number(&storage.source, None)?;
-        }
-
+        let dev_num = get_block_device_number_for_storage(&mut storage, ctx.sandbox).await?;
         handle_block_storage(ctx.logger, &storage, &dev_num).await
     }
 }
@@ -316,10 +351,7 @@ impl StorageHandler for VirtioBlkCcwHandler {
         mut storage: Storage,
         ctx: &mut StorageContext,
     ) -> Result<Arc<dyn StorageDevice>> {
-        let ccw_device = ccw::Device::from_str(&storage.source)?;
-        let dev_path = get_virtio_blk_ccw_device_name(ctx.sandbox, &ccw_device).await?;
-        storage.source = dev_path;
-        let dev_num = get_device_number(&storage.source, None)?;
+        let dev_num = get_block_device_number_for_storage(&mut storage, ctx.sandbox).await?;
         handle_block_storage(ctx.logger, &storage, &dev_num).await
     }
 
@@ -350,11 +382,7 @@ impl StorageHandler for ScsiHandler {
         mut storage: Storage,
         ctx: &mut StorageContext,
     ) -> Result<Arc<dyn StorageDevice>> {
-        // Retrieve the device path from SCSI address.
-        let dev_path = get_scsi_device_name(ctx.sandbox, &storage.source).await?;
-        storage.source = dev_path.clone();
-
-        let dev_num = get_device_number(&dev_path, None)?;
+        let dev_num = get_block_device_number_for_storage(&mut storage, ctx.sandbox).await?;
         handle_block_storage(ctx.logger, &storage, &dev_num).await
     }
 }

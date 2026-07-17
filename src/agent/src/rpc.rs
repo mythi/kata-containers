@@ -87,7 +87,10 @@ use crate::passfd_io;
 use crate::pci;
 use crate::random;
 use crate::sandbox::{Sandbox, SandboxError};
-use crate::storage::{add_storages, update_ephemeral_mounts, STORAGE_HANDLERS};
+use crate::storage::{
+    add_storages, get_block_device_number_for_storage, is_ephemeral_encrypted_block_storage,
+    update_ephemeral_mounts, STORAGE_HANDLERS,
+};
 use crate::util;
 use crate::version::{AGENT_VERSION, API_VERSION};
 use crate::AGENT_CONFIG;
@@ -311,7 +314,8 @@ impl AgentService {
         .await?;
 
         // Handle trusted storage configuration before mounting any storage
-        cdh_handler_trusted_storage(&mut oci)
+        let mut storages = req.storages.clone();
+        cdh_handler_trusted_storage(&mut oci, &mut storages, &self.sandbox)
             .await
             .map_err(|e| anyhow!("failed to handle trusted storage: {}", e))?;
 
@@ -322,13 +326,7 @@ impl AgentService {
         // After all those storages have been processed, no matter the order
         // here, the agent will rely on rustjail (using the oci.Mounts
         // list) to bind mount all of them inside the container.
-        let m = add_storages(
-            sl(),
-            req.storages.clone(),
-            &self.sandbox,
-            Some(req.container_id),
-        )
-        .await?;
+        let m = add_storages(sl(), storages, &self.sandbox, Some(req.container_id)).await?;
 
         // Handle sealed secrets after storage is mounted
         cdh_handler_sealed_secrets(&mut oci)
@@ -2620,7 +2618,34 @@ fn is_sealed_secret_path(source_path: &str) -> bool {
             .any(|suffix| source_path.ends_with(suffix))
 }
 
-async fn cdh_handler_trusted_storage(oci: &mut Spec) -> Result<()> {
+async fn cdh_handler_trusted_storage(
+    oci: &mut Spec,
+    storages: &mut Vec<protocols::agent::Storage>,
+    sandbox: &Arc<Mutex<Sandbox>>,
+) -> Result<()> {
+    if !confidential_data_hub::is_cdh_client_initialized() {
+        return Ok(());
+    }
+
+    if let Some(mut storage) = take_trusted_storage_from_mount(oci, storages)? {
+        if !is_ephemeral_encrypted_block_storage(&storage) {
+            return Err(anyhow!(
+                "{} must be backed by an encrypted block emptyDir",
+                TRUSTED_IMAGE_STORAGE_DEVICE
+            ));
+        }
+        let dev_major_minor = get_block_device_number_for_storage(&mut storage, sandbox).await?;
+        cdh_secure_mount(
+            "block-device",
+            &dev_major_minor,
+            "luks2",
+            KATA_IMAGE_WORK_DIR,
+            "-E lazy_journal_init",
+        )
+        .await?;
+        return Ok(());
+    }
+
     let linux = oci
         .linux()
         .as_ref()
@@ -2643,6 +2668,46 @@ async fn cdh_handler_trusted_storage(oci: &mut Spec) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn take_trusted_storage_from_mount(
+    oci: &mut Spec,
+    storages: &mut Vec<protocols::agent::Storage>,
+) -> Result<Option<protocols::agent::Storage>> {
+    let Some(mounts) = oci.mounts_mut().as_mut() else {
+        return Ok(None);
+    };
+
+    let Some(mount_idx) = mounts.iter().position(|mount| {
+        mount.destination().as_path().to_str() == Some(TRUSTED_IMAGE_STORAGE_DEVICE)
+    }) else {
+        return Ok(None);
+    };
+
+    let source = mounts[mount_idx]
+        .source()
+        .as_ref()
+        .and_then(|source| source.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "{} mount does not have a valid source",
+                TRUSTED_IMAGE_STORAGE_DEVICE
+            )
+        })?;
+
+    let storage_idx = storages
+        .iter()
+        .position(|storage| storage.mount_point == source)
+        .ok_or_else(|| {
+            anyhow!(
+                "no storage found for {} mount source {}",
+                TRUSTED_IMAGE_STORAGE_DEVICE,
+                source
+            )
+        })?;
+
+    mounts.remove(mount_idx);
+    Ok(Some(storages.remove(storage_idx)))
 }
 
 pub(crate) async fn cdh_secure_mount(
@@ -2783,6 +2848,52 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             timeout_nano: 0,
         }
+    }
+
+    #[test]
+    fn take_trusted_storage_from_mount_consumes_matching_storage() {
+        let trusted_source = "/run/kata-containers/sandbox/storage/trusted";
+
+        let mut trusted_mount = oci::Mount::default();
+        trusted_mount.set_destination(PathBuf::from(TRUSTED_IMAGE_STORAGE_DEVICE));
+        trusted_mount.set_source(Some(PathBuf::from(trusted_source)));
+
+        let mut regular_mount = oci::Mount::default();
+        regular_mount.set_destination(PathBuf::from("/data"));
+        regular_mount.set_source(Some(PathBuf::from(
+            "/run/kata-containers/sandbox/storage/data",
+        )));
+
+        let mut spec = Spec::default();
+        spec.set_mounts(Some(vec![trusted_mount, regular_mount]));
+
+        let expected_storage = protocols::agent::Storage {
+            mount_point: trusted_source.to_string(),
+            ..Default::default()
+        };
+        let mut storages = vec![
+            expected_storage.clone(),
+            protocols::agent::Storage {
+                mount_point: "/run/kata-containers/sandbox/storage/data".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let storage = take_trusted_storage_from_mount(&mut spec, &mut storages)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(storage, expected_storage);
+        assert_eq!(storages.len(), 1);
+        assert_eq!(
+            spec.mounts()
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|mount| mount.destination().as_path())
+                .collect::<Vec<_>>(),
+            vec![Path::new("/data")]
+        );
     }
 
     fn create_dummy_opts() -> CreateOpts {

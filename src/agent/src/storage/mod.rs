@@ -21,7 +21,10 @@ use tokio::sync::Mutex;
 use tracing::instrument;
 
 use self::bind_watcher_handler::BindWatcherHandler;
-use self::block_handler::{PmemHandler, ScsiHandler, VirtioBlkMmioHandler, VirtioBlkPciHandler};
+pub(crate) use self::block_handler::{
+    get_block_device_number_for_storage, is_ephemeral_encrypted_block_storage, PmemHandler,
+    ScsiHandler, VirtioBlkMmioHandler, VirtioBlkPciHandler,
+};
 pub use self::ephemeral_handler::update_ephemeral_mounts;
 use self::ephemeral_handler::EphemeralHandler;
 use self::fs_handler::{OverlayfsHandler, VirtioFsHandler};
