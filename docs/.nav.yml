@@ -16,6 +16,7 @@ nav:
     - Use Cases:
       - NVIDIA GPU Passthrough: use-cases/NVIDIA-GPU-passthrough-and-Kata-QEMU.md
       - NVIDIA vGPU: use-cases/NVIDIA-GPU-passthrough-and-Kata.md
+      - Intel Xe SR-IOV GPU: use-cases/Intel-Xe-SR-IOV-GPU-and-Kata.md
       - Intel QAT: use-cases/using-Intel-QAT-and-kata.md
     - How To:
       - NUMA Support: how-to/how-to-use-numa-with-kata.md
